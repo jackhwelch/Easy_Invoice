@@ -9,6 +9,7 @@ import io
 import zipfile
 import matplotlib.pyplot as plt
 import base64
+import streamlit.components.v1 as components
 
 st.set_page_config(layout="wide")
 
@@ -438,11 +439,10 @@ def show_pdf_preview(pdf_bytes):
             src="data:application/pdf;base64,{base64_pdf}"
             width="100%"
             height="820"
-            type="application/pdf"
             style="border: 1px solid #ddd; border-radius: 8px; background: white;"
         ></iframe>
     """
-    st.markdown(pdf_display, unsafe_allow_html=True)
+    components.html(pdf_display, height=830, scrolling=True)
 
 
 # --- My Clients Page ---
