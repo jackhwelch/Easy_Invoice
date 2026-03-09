@@ -38,6 +38,12 @@ def default_settings():
             "tax_percentage": 0.0,
             "payment_terms_days": 30
         },
+        "invoice_numbering": {
+            "mode": "simple",   # simple / yearly
+            "prefix": "INV",
+            "digits": 4,
+            "separator": "-"
+        },
         "display_options": {
             "show_logo": True,
             "show_address": True,
@@ -109,13 +115,17 @@ if st.session_state.my_details:
 st.session_state.settings = settings
 sync_my_details_from_settings()
 
-if 'page' not in st.session_state:
+if "page" not in st.session_state:
     st.session_state.page = "main"
-if 'edit_client_idx' not in st.session_state:
-    st.session_state.edit_client_idx = None
-if 'edit_invoice_idx' not in st.session_state:
+if "client_dialog_idx" not in st.session_state:
+    st.session_state.client_dialog_idx = None
+if "client_dialog_edit_mode" not in st.session_state:
+    st.session_state.client_dialog_edit_mode = False
+if "previous_selected_clients" not in st.session_state:
+    st.session_state.previous_selected_clients = []
+if "edit_invoice_idx" not in st.session_state:
     st.session_state.edit_invoice_idx = None
-if 'confirm_delete_invoices' not in st.session_state:
+if "confirm_delete_invoices" not in st.session_state:
     st.session_state.confirm_delete_invoices = False
 
 
@@ -137,20 +147,66 @@ def page_header(title, back_label=None, back_page=None, help_text=None):
 
 
 # --- Auto invoice number ---
-def get_next_invoice_number():
-    if not st.session_state.invoices:
-        return "INV-0001"
+def get_next_invoice_number(client=None, invoice_date=None):
+    global_numbering = st.session_state.settings.get("invoice_numbering", {})
+    mode = global_numbering.get("mode", "simple")
+    prefix = global_numbering.get("prefix", "INV").strip() or "INV"
+    digits = int(global_numbering.get("digits", 4))
+    separator = global_numbering.get("separator", "-")
 
-    numbers = []
-    for inv in st.session_state.invoices:
+    if client is not None and client.get("Use Custom Numbering", False):
+        mode = client.get("Custom Numbering Mode", mode)
+        prefix = client.get("Custom Number Prefix", "").strip() or prefix
+
+    if invoice_date is None:
+        invoice_date = datetime.today()
+    year = invoice_date.year
+
+    invoices = st.session_state.invoices
+
+    def extract_last_number(invoice_number):
         try:
-            num = int(str(inv["Invoice Number"]).replace("INV-", ""))
-            numbers.append(num)
+            return int(str(invoice_number).split(separator)[-1])
         except:
-            pass
+            return None
 
-    next_num = max(numbers) + 1 if numbers else 1
-    return f"INV-{next_num:04d}"
+    if mode == "simple":
+        numbers = []
+        for inv in invoices:
+            inv_client_name = inv.get("Client", "")
+            if client is not None and client.get("Use Custom Numbering", False):
+                if inv_client_name != client.get("Company Name", ""):
+                    continue
+
+            inv_number = str(inv.get("Invoice Number", ""))
+            if inv_number.startswith(f"{prefix}{separator}"):
+                num = extract_last_number(inv_number)
+                if num is not None:
+                    numbers.append(num)
+
+        next_num = max(numbers) + 1 if numbers else 1
+        return f"{prefix}{separator}{next_num:0{digits}d}"
+
+    elif mode == "yearly":
+        year_tag = str(year)
+        numbers = []
+
+        for inv in invoices:
+            inv_client_name = inv.get("Client", "")
+            if client is not None and client.get("Use Custom Numbering", False):
+                if inv_client_name != client.get("Company Name", ""):
+                    continue
+
+            inv_number = str(inv.get("Invoice Number", ""))
+            if inv_number.startswith(f"{prefix}{separator}{year_tag}{separator}"):
+                num = extract_last_number(inv_number)
+                if num is not None:
+                    numbers.append(num)
+
+        next_num = max(numbers) + 1 if numbers else 1
+        return f"{prefix}{separator}{year_tag}{separator}{next_num:0{digits}d}"
+
+    return f"{prefix}{separator}0001"
 
 
 # --- Ensure invoice status / due date fields exist ---
@@ -162,6 +218,8 @@ def ensure_invoice_fields():
     default_currency = defaults.get("currency", "AED")
     default_tax = defaults.get("tax_percentage", 0.0)
     default_terms = int(defaults.get("payment_terms_days", 30))
+
+    valid_statuses = ["Draft", "Sent", "Overdue", "Paid", "Cancelled"]
 
     for inv in st.session_state.invoices:
         if "Due Date" not in inv:
@@ -176,7 +234,7 @@ def ensure_invoice_fields():
             inv["Status"] = "Draft"
             changed = True
 
-        if "Status" in inv and inv["Status"] not in ["Draft", "Sent", "Paid", "Overdue"]:
+        if inv["Status"] not in valid_statuses:
             inv["Status"] = "Draft"
             changed = True
 
@@ -192,12 +250,19 @@ def ensure_invoice_fields():
             inv["Currency"] = default_currency
             changed = True
 
-        if inv["Status"] != "Paid":
+        if "Sent Date" not in inv:
+            inv["Sent Date"] = ""
+            changed = True
+
+        if "Paid Date" not in inv:
+            inv["Paid Date"] = ""
+            changed = True
+
+        if inv["Status"] not in ["Paid", "Cancelled"]:
             try:
                 due_date = datetime.strptime(inv["Due Date"], "%d/%m/%Y").date()
-                new_status = "Overdue" if (inv["Status"] == "Sent" and due_date < today) else inv["Status"]
-                if inv["Status"] != new_status:
-                    inv["Status"] = new_status
+                if inv["Status"] == "Sent" and due_date < today:
+                    inv["Status"] = "Overdue"
                     changed = True
             except:
                 pass
@@ -218,7 +283,6 @@ def build_invoice_pdf(my_details, client, invoice_number, items, tax_percent, cu
     display = settings["display_options"]
     branding = settings["branding"]
 
-    # --- Dynamic header layout to prevent overlap ---
     header_top_y = 10
     left_x = 10
     logo_x = 155
@@ -243,10 +307,10 @@ def build_invoice_pdf(my_details, client, invoice_number, items, tax_percent, cu
             pass
 
     pdf.set_xy(left_x, header_top_y)
-    pdf.set_font("Arial", 'B', 20)
+    pdf.set_font("Arial", "B", 20)
     pdf.cell(0, 10, my_details.get("Name", ""), ln=True)
 
-    pdf.set_font("Arial", '', 11)
+    pdf.set_font("Arial", "", 11)
     if display.get("show_address", True) and my_details.get("Address", ""):
         pdf.multi_cell(0, 5, my_details.get("Address", ""))
 
@@ -265,79 +329,77 @@ def build_invoice_pdf(my_details, client, invoice_number, items, tax_percent, cu
     header_bottom_y = max(text_bottom_y, logo_bottom_y)
     pdf.set_y(header_bottom_y + 5)
 
-    pdf.set_font("Arial", 'B', 16)
-    pdf.cell(0, 10, "INVOICE", ln=True, align='R')
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(0, 10, "INVOICE", ln=True, align="R")
 
-    pdf.set_font("Arial", '', 12)
-    pdf.cell(0, 5, f"Invoice Number: {invoice_number}", ln=True, align='R')
-    pdf.cell(0, 5, f"Date: {invoice_date.strftime('%d/%m/%Y')}", ln=True, align='R')
+    pdf.set_font("Arial", "", 12)
+    pdf.cell(0, 5, f"Invoice Number: {invoice_number}", ln=True, align="R")
+    pdf.cell(0, 5, f"Date: {invoice_date.strftime('%d/%m/%Y')}", ln=True, align="R")
 
     if display.get("show_payment_terms", True):
-        pdf.cell(0, 5, f"Due Date: {due_date.strftime('%d/%m/%Y')}", ln=True, align='R')
+        pdf.cell(0, 5, f"Due Date: {due_date.strftime('%d/%m/%Y')}", ln=True, align="R")
         terms_days = settings["invoice_defaults"].get("payment_terms_days", 30)
-        pdf.cell(0, 5, f"Payment Terms: {terms_days} days", ln=True, align='R')
+        pdf.cell(0, 5, f"Payment Terms: {terms_days} days", ln=True, align="R")
 
     pdf.ln(10)
-    pdf.set_font("Arial", 'B', 12)
+    pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 5, "Bill To:", ln=True)
-    pdf.set_font("Arial", '', 12)
+    pdf.set_font("Arial", "", 12)
     pdf.cell(0, 5, f"{client['Company Name']} ({client['Contact Person']})", ln=True)
-    pdf.multi_cell(0, 5, client['Address'])
+    pdf.multi_cell(0, 5, client["Address"])
     pdf.ln(5)
 
-    # Table header
     pdf.set_fill_color(200, 200, 200)
-    pdf.set_font("Arial", 'B', 12)
-    pdf.cell(80, 10, "Job Name", 1, 0, 'C', 1)
-    pdf.cell(40, 10, "Job Number", 1, 0, 'C', 1)
-    pdf.cell(40, 10, f"Amount ({currency})", 1, 1, 'C', 1)
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(80, 10, "Job Name", 1, 0, "C", 1)
+    pdf.cell(40, 10, "Job Number", 1, 0, "C", 1)
+    pdf.cell(40, 10, f"Amount ({currency})", 1, 1, "C", 1)
 
-    # Table body
-    pdf.set_font("Arial", '', 12)
+    pdf.set_font("Arial", "", 12)
     fill = False
     subtotal = 0
     for item in items:
         amount_value = float(item.get("Amount", 0.0))
         pdf.set_fill_color(240, 240, 240) if fill else pdf.set_fill_color(255, 255, 255)
-        pdf.cell(80, 10, str(item.get("Job Name", "")), 1, 0, 'L', fill)
-        pdf.cell(40, 10, str(item.get("Job Number", "")), 1, 0, 'C', fill)
-        pdf.cell(40, 10, f"{amount_value:,.2f}", 1, 1, 'R', fill)
+        pdf.cell(80, 10, str(item.get("Job Name", "")), 1, 0, "L", fill)
+        pdf.cell(40, 10, str(item.get("Job Number", "")), 1, 0, "C", fill)
+        pdf.cell(40, 10, f"{amount_value:,.2f}", 1, 1, "R", fill)
         subtotal += amount_value
         fill = not fill
 
     pdf.ln(5)
-    pdf.set_font("Arial", 'B', 12)
-    pdf.cell(120, 10, "Subtotal", 1, 0, 'R', 1)
-    pdf.cell(40, 10, f"{subtotal:,.2f}", 1, 1, 'R', 1)
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(120, 10, "Subtotal", 1, 0, "R", 1)
+    pdf.cell(40, 10, f"{subtotal:,.2f}", 1, 1, "R", 1)
 
     tax_amount = subtotal * (tax_percent / 100)
     if tax_amount > 0:
-        pdf.cell(120, 10, f"Tax ({tax_percent}%)", 1, 0, 'R', 1)
-        pdf.cell(40, 10, f"{tax_amount:,.2f}", 1, 1, 'R', 1)
+        pdf.cell(120, 10, f"Tax ({tax_percent}%)", 1, 0, "R", 1)
+        pdf.cell(40, 10, f"{tax_amount:,.2f}", 1, 1, "R", 1)
 
     total = subtotal + tax_amount
-    pdf.cell(120, 10, "Total", 1, 0, 'R', 1)
-    pdf.cell(40, 10, f"{total:,.2f} {currency}", 1, 1, 'R', 1)
+    pdf.cell(120, 10, "Total", 1, 0, "R", 1)
+    pdf.cell(40, 10, f"{total:,.2f} {currency}", 1, 1, "R", 1)
 
     pdf.ln(10)
 
     if display.get("show_bank_details", True):
         bank_lines = []
-        if my_details.get('Account Number', ''):
+        if my_details.get("Account Number", ""):
             bank_lines.append(f"Account: {my_details.get('Account Number', '')}")
-        if my_details.get('Sort Code', ''):
+        if my_details.get("Sort Code", ""):
             bank_lines.append(f"Sort Code: {my_details.get('Sort Code', '')}")
-        if my_details.get('SWIFT', ''):
+        if my_details.get("SWIFT", ""):
             bank_lines.append(f"SWIFT: {my_details.get('SWIFT', '')}")
 
         if bank_lines:
-            pdf.set_font("Arial", 'I', 10)
+            pdf.set_font("Arial", "I", 10)
             pdf.multi_cell(0, 5, "Bank Details:\n" + "\n".join(bank_lines))
             pdf.ln(5)
 
     footer_text = branding.get("footer_text", "Thank you for your business!")
     if footer_text:
-        pdf.set_font("Arial", 'I', 10)
+        pdf.set_font("Arial", "I", 10)
         pdf.multi_cell(0, 5, footer_text)
 
     return pdf, total
@@ -352,7 +414,7 @@ def generate_invoice_pdf(my_details, client, invoice_number, items, tax_percent,
     if not os.path.exists(invoices_folder):
         os.makedirs(invoices_folder)
 
-    safe_company = client['Company Name'].replace(' ', '_').replace('/', '_')
+    safe_company = client["Company Name"].replace(" ", "_").replace("/", "_")
     filename = f"Invoice_{invoice_number}_{safe_company}.pdf"
     filepath = os.path.join(invoices_folder, filename)
     pdf.output(filepath)
@@ -381,17 +443,188 @@ def show_pdf_preview(pdf_bytes):
     st.markdown(pdf_display, unsafe_allow_html=True)
 
 
+# --- My Clients Page ---
+@st.dialog("Client Details")
+def show_client_dialog(idx):
+    if idx is None or idx >= len(st.session_state.clients):
+        st.warning("No client selected.")
+        st.session_state.client_dialog_idx = None
+        st.session_state.client_dialog_edit_mode = False
+        return
+
+    client = st.session_state.clients[idx]
+    edit_mode = st.session_state.client_dialog_edit_mode
+
+    button_col_left, button_col_right = st.columns([6, 2])
+
+    with button_col_right:
+        if edit_mode:
+            if st.button("Cancel Edit", use_container_width=True, key=f"dialog_cancel_edit_{idx}"):
+                st.session_state.client_dialog_idx = None
+                st.session_state.client_dialog_edit_mode = False
+                st.rerun()
+        else:
+            if st.button("Edit Client", use_container_width=True, key=f"dialog_edit_client_{idx}"):
+                st.session_state.client_dialog_idx = idx
+                st.session_state.client_dialog_edit_mode = True
+                st.rerun()
+
+    st.markdown("<div style='margin-top:-10px;'></div>", unsafe_allow_html=True)
+    st.markdown("---")
+
+    if edit_mode:
+        with st.form(key=f"client_edit_form_{idx}", border=False):
+            form_left, form_right = st.columns([1, 1])
+
+            with form_left:
+                company = st.text_input("Company Name", client.get("Company Name", ""))
+                contact = st.text_input("Contact Person", client.get("Contact Person", ""))
+                email = st.text_input("Email Address", client.get("Email", ""))
+                phone = st.text_input("Phone Number", client.get("Phone", ""))
+                invoice_email = st.text_input("Invoice Email", client.get("Invoice Email", ""))
+                payment_terms = st.number_input(
+                    "Payment Terms (days)",
+                    min_value=1,
+                    value=int(client.get("Payment Terms", 30))
+                )
+                vat_number = st.text_input("VAT / Tax Number", client.get("VAT Number", ""))
+
+            with form_right:
+                currency_options = ["", "AED", "USD", "EUR", "GBP", "INR", "JPY", "CHF", "AUD", "CAD"]
+                current_currency = client.get("Default Currency", "")
+                if current_currency not in currency_options:
+                    current_currency = ""
+
+                default_currency = st.selectbox(
+                    "Default Currency",
+                    currency_options,
+                    index=currency_options.index(current_currency)
+                )
+
+                use_custom_numbering = st.checkbox(
+                    "Use Custom Numbering For This Client",
+                    value=client.get("Use Custom Numbering", False)
+                )
+
+                custom_mode_options = ["simple", "yearly"]
+                current_custom_mode = client.get("Custom Numbering Mode", "simple")
+                if current_custom_mode not in custom_mode_options:
+                    current_custom_mode = "simple"
+
+                custom_numbering_mode = st.selectbox(
+                    "Client Numbering Mode",
+                    custom_mode_options,
+                    index=custom_mode_options.index(current_custom_mode)
+                )
+
+                custom_number_prefix = st.text_input(
+                    "Client Number Prefix",
+                    client.get("Custom Number Prefix", "")
+                )
+
+                sep = st.session_state.settings.get("invoice_numbering", {}).get("separator", "-")
+                digits = int(st.session_state.settings.get("invoice_numbering", {}).get("digits", 4))
+                preview_year = datetime.today().year
+                preview_prefix = custom_number_prefix.strip() or st.session_state.settings.get("invoice_numbering", {}).get("prefix", "INV")
+
+                if custom_numbering_mode == "simple":
+                    preview = f"{preview_prefix}{sep}{1:0{digits}d}"
+                else:
+                    preview = f"{preview_prefix}{sep}{preview_year}{sep}{1:0{digits}d}"
+
+                if use_custom_numbering:
+                    st.caption(f"Preview: {preview}")
+                else:
+                    st.caption("Client custom numbering is off. Default app numbering will be used.")
+
+            st.markdown("---")
+            address = st.text_area("Address", client.get("Address", ""), height=120)
+            notes = st.text_area("Notes", client.get("Notes", ""), height=160)
+
+            st.markdown("---")
+            save_col1, save_col2 = st.columns(2)
+
+            with save_col1:
+                save_changes = st.form_submit_button("Save Changes", use_container_width=True)
+            with save_col2:
+                close_without_save = st.form_submit_button("Close", use_container_width=True)
+
+            if save_changes:
+                st.session_state.clients[idx] = {
+                    "Company Name": company.strip(),
+                    "Contact Person": contact.strip(),
+                    "Email": email.strip(),
+                    "Phone": phone.strip(),
+                    "Invoice Email": invoice_email.strip(),
+                    "Payment Terms": int(payment_terms),
+                    "VAT Number": vat_number.strip(),
+                    "Default Currency": default_currency.strip(),
+                    "Use Custom Numbering": bool(use_custom_numbering),
+                    "Custom Numbering Mode": custom_numbering_mode if use_custom_numbering else "",
+                    "Custom Number Prefix": custom_number_prefix.strip() if use_custom_numbering else "",
+                    "Address": address.strip(),
+                    "Notes": notes.strip()
+                }
+                save_json(CLIENTS_FILE, st.session_state.clients)
+                st.session_state.client_dialog_idx = None
+                st.session_state.client_dialog_edit_mode = False
+                st.rerun()
+
+            if close_without_save:
+                st.session_state.client_dialog_idx = None
+                st.session_state.client_dialog_edit_mode = False
+                st.rerun()
+
+    else:
+        form_left, form_right = st.columns([1, 1])
+
+        with form_left:
+            st.text_input("Company Name", client.get("Company Name", ""), disabled=True)
+            st.text_input("Contact Person", client.get("Contact Person", ""), disabled=True)
+            st.text_input("Email Address", client.get("Email", ""), disabled=True)
+            st.text_input("Phone Number", client.get("Phone", ""), disabled=True)
+            st.text_input("Invoice Email", client.get("Invoice Email", ""), disabled=True)
+            st.number_input(
+                "Payment Terms (days)",
+                min_value=1,
+                value=int(client.get("Payment Terms", 30)),
+                disabled=True
+            )
+            st.text_input("VAT / Tax Number", client.get("VAT Number", ""), disabled=True)
+
+        with form_right:
+            st.text_input("Default Currency", client.get("Default Currency", ""), disabled=True)
+            st.checkbox(
+                "Use Custom Numbering For This Client",
+                value=client.get("Use Custom Numbering", False),
+                disabled=True
+            )
+            st.text_input("Client Numbering Mode", client.get("Custom Numbering Mode", ""), disabled=True)
+            st.text_input("Client Number Prefix", client.get("Custom Number Prefix", ""), disabled=True)
+
+        st.markdown("---")
+        st.text_area("Address", client.get("Address", ""), height=120, disabled=True)
+        st.text_area("Notes", client.get("Notes", ""), height=160, disabled=True)
+
+        st.markdown("---")
+        if st.button("Close", use_container_width=True, key=f"dialog_close_client_{idx}"):
+            st.session_state.client_dialog_idx = None
+            st.session_state.client_dialog_edit_mode = False
+            st.rerun()
+
+
 # --- Settings Page ---
 def settings_page():
     page_header(
         "Settings",
-        back_label="Back to Main Menu",
+        back_label="Back to Dashboard",
         back_page="main",
-        help_text="Manage your business details, invoice defaults, branding, and display options."
+        help_text="Manage your business details, invoice defaults, branding, display options, and numbering."
     )
 
     business = st.session_state.settings["business_details"]
     defaults = st.session_state.settings["invoice_defaults"]
+    numbering = st.session_state.settings.get("invoice_numbering", {})
     display = st.session_state.settings["display_options"]
     branding = st.session_state.settings["branding"]
 
@@ -421,9 +654,63 @@ def settings_page():
         if current_currency not in currency_options:
             current_currency = "AED"
 
-        default_currency = st.selectbox("Default Currency", currency_options, index=currency_options.index(current_currency))
-        default_tax = st.number_input("Default Tax Percentage", min_value=0.0, value=float(defaults.get("tax_percentage", 0.0)))
-        payment_terms_days = st.number_input("Default Payment Terms (days)", min_value=1, value=int(defaults.get("payment_terms_days", 30)))
+        default_currency = st.selectbox(
+            "Default Currency",
+            currency_options,
+            index=currency_options.index(current_currency)
+        )
+        default_tax = st.number_input(
+            "Default Tax Percentage",
+            min_value=0.0,
+            value=float(defaults.get("tax_percentage", 0.0))
+        )
+        payment_terms_days = st.number_input(
+            "Default Payment Terms (days)",
+            min_value=1,
+            value=int(defaults.get("payment_terms_days", 30))
+        )
+
+        st.markdown("---")
+        st.subheader("Invoice Numbering")
+
+        numbering_mode_options = ["simple", "yearly"]
+        current_mode = numbering.get("mode", "simple")
+        if current_mode not in numbering_mode_options:
+            current_mode = "simple"
+
+        numbering_mode = st.selectbox(
+            "Default Numbering Mode",
+            numbering_mode_options,
+            index=numbering_mode_options.index(current_mode)
+        )
+        numbering_prefix = st.text_input("Default Number Prefix", numbering.get("prefix", "INV"))
+        numbering_digits = st.number_input(
+            "Number of Digits",
+            min_value=2,
+            max_value=8,
+            value=int(numbering.get("digits", 4))
+        )
+
+        separator_options = ["-", "/", "_", "."]
+        current_separator = numbering.get("separator", "-")
+        if current_separator not in separator_options:
+            current_separator = "-"
+
+        numbering_separator = st.selectbox(
+            "Separator",
+            separator_options,
+            index=separator_options.index(current_separator)
+        )
+
+        preview_prefix = numbering_prefix.strip() or "INV"
+        preview_year = datetime.today().year
+
+        if numbering_mode == "simple":
+            numbering_preview = f"{preview_prefix}{numbering_separator}{1:0{int(numbering_digits)}d}"
+        else:
+            numbering_preview = f"{preview_prefix}{numbering_separator}{preview_year}{numbering_separator}{1:0{int(numbering_digits)}d}"
+
+        st.caption(f"Preview: {numbering_preview}")
 
         st.markdown("---")
         st.subheader("Display Options")
@@ -438,7 +725,11 @@ def settings_page():
         st.markdown("---")
         st.subheader("Branding")
         current_invoice_logo_file = branding.get("invoice_logo_file", "")
-        footer_text = st.text_area("Invoice Footer Text", branding.get("footer_text", "Thank you for your business!"), height=100)
+        footer_text = st.text_area(
+            "Invoice Footer Text",
+            branding.get("footer_text", "Thank you for your business!"),
+            height=100
+        )
         invoice_logo_file_input = st.text_input("Invoice Logo Filename / Path", current_invoice_logo_file)
         uploaded_logo = st.file_uploader("Upload Invoice Logo (PNG/JPG)", type=["png", "jpg", "jpeg"])
 
@@ -477,6 +768,12 @@ def settings_page():
                 "tax_percentage": default_tax,
                 "payment_terms_days": payment_terms_days
             },
+            "invoice_numbering": {
+                "mode": numbering_mode,
+                "prefix": numbering_prefix.strip() or "INV",
+                "digits": int(numbering_digits),
+                "separator": numbering_separator
+            },
             "display_options": {
                 "show_logo": show_logo,
                 "show_address": show_address,
@@ -500,7 +797,7 @@ def settings_page():
 
 # --- Main Menu ---
 def show_main_menu():
-    top_left, top_right = st.columns([3, 2], vertical_alignment="center")
+    top_left, top_right = st.columns([4, 1.3], vertical_alignment="top")
 
     with top_left:
         if os.path.exists(LOGO_FILE):
@@ -533,26 +830,29 @@ def show_main_menu():
         st.button("Settings", use_container_width=True, on_click=lambda: st.session_state.update({"page": "settings"}))
         st.button("My Clients", use_container_width=True, on_click=lambda: st.session_state.update({"page": "my_clients"}))
         st.button("My Invoices", use_container_width=True, on_click=lambda: st.session_state.update({"page": "my_invoices"}))
-        st.button("Generate New Invoice", use_container_width=True, on_click=lambda: st.session_state.update({"page": "create_invoice"}))
 
     st.markdown("---")
     show_dashboard()
 
 
-# --- My Clients Page ---
 def my_clients_page():
-    page_header(
-        "My Clients",
-        back_label="Back to Main Menu",
-        back_page="main",
-        help_text="Manage your saved clients and keep your client list organised."
-    )
+    header_left, header_right = st.columns([6, 2])
 
-    header_col1, header_col2 = st.columns([1, 4])
-    with header_col1:
-        if st.button("Add Client", use_container_width=True):
-            st.session_state.page = "add_client"
-            st.rerun()
+    with header_left:
+        st.title("My Clients")
+        st.caption("Manage your saved clients and keep your client list organised.")
+
+    with header_right:
+        st.button(
+            "Back to Main Menu",
+            use_container_width=True,
+            on_click=lambda: st.session_state.update({"page": "main"})
+        )
+        st.button(
+            "Add Client",
+            use_container_width=True,
+            on_click=lambda: st.session_state.update({"page": "add_client"})
+        )
 
     st.markdown("---")
 
@@ -563,36 +863,104 @@ def my_clients_page():
     st.subheader("Clients Table")
 
     df = pd.DataFrame(st.session_state.clients).copy()
-    df["Select"] = False
 
-    edited_df = st.data_editor(df, use_container_width=True, num_rows="fixed", hide_index=True)
+    if "Email" not in df.columns:
+        df["Email"] = ""
+    if "Phone" not in df.columns:
+        df["Phone"] = ""
+    if "Invoice Email" not in df.columns:
+        df["Invoice Email"] = ""
+    if "Use Custom Numbering" not in df.columns:
+        df["Use Custom Numbering"] = False
+    if "Custom Numbering Mode" not in df.columns:
+        df["Custom Numbering Mode"] = ""
+    if "Custom Number Prefix" not in df.columns:
+        df["Custom Number Prefix"] = ""
+    if "Payment Terms" not in df.columns:
+        df["Payment Terms"] = 30
+    if "Notes" not in df.columns:
+        df["Notes"] = ""
+    if "VAT Number" not in df.columns:
+        df["VAT Number"] = ""
+    if "Default Currency" not in df.columns:
+        df["Default Currency"] = ""
+
+    table_df = df[[
+        "Company Name",
+        "Contact Person",
+        "Email",
+        "Phone",
+        "Invoice Email",
+        "Payment Terms"
+    ]].copy()
+
+    table_df["Select"] = False
+
+    edited_df = st.data_editor(
+        table_df,
+        use_container_width=True,
+        num_rows="fixed",
+        hide_index=True,
+        key="clients_table_editor"
+    )
+
     selected_rows = edited_df[edited_df["Select"] == True]
 
-    if not selected_rows.empty:
-        st.markdown("---")
-        st.subheader("Selected Client Actions")
-        st.caption(f"{len(selected_rows)} client(s) selected")
+    selected_companies = sorted(selected_rows["Company Name"].tolist())
+    previous_selected_companies = st.session_state.get("previous_selected_clients", [])
 
-        action_col1, action_col2, action_col3 = st.columns([1, 1, 3])
+    if selected_companies != previous_selected_companies:
+        st.session_state.client_dialog_idx = None
+        st.session_state.client_dialog_edit_mode = False
+        st.session_state.previous_selected_clients = selected_companies
 
-        with action_col1:
-            if len(selected_rows) == 1 and st.button("Edit Selected Client", use_container_width=True):
-                selected_company = selected_rows.iloc[0]["Company Name"]
-                for idx, client in enumerate(st.session_state.clients):
-                    if client["Company Name"] == selected_company:
-                        st.session_state.edit_client_idx = idx
-                        st.session_state.page = "edit_client"
-                        st.rerun()
+    st.markdown("---")
+    st.subheader("Selected Client Actions")
 
-        with action_col2:
-            if len(selected_rows) == 1 and st.button("Delete Selected Client", use_container_width=True):
-                selected_company = selected_rows.iloc[0]["Company Name"]
-                st.session_state.clients = [
-                    client for client in st.session_state.clients
-                    if client["Company Name"] != selected_company
-                ]
-                save_json(CLIENTS_FILE, st.session_state.clients)
-                st.rerun()
+    selected_count = len(selected_rows)
+    single_selected = selected_count == 1
+
+    if selected_count == 0:
+        st.caption("Select one client from the table to view, edit, or delete.")
+    elif selected_count == 1:
+        st.caption("1 client selected.")
+    else:
+        st.caption(f"{selected_count} clients selected.")
+
+    action_col1, action_col2, action_col3, action_col4 = st.columns([1, 1, 1, 3])
+
+    with action_col1:
+        if st.button("View Selected Client", use_container_width=True, disabled=not single_selected):
+            selected_company = selected_rows.iloc[0]["Company Name"]
+            for idx, client in enumerate(st.session_state.clients):
+                if client["Company Name"] == selected_company:
+                    st.session_state.client_dialog_idx = idx
+                    st.session_state.client_dialog_edit_mode = False
+                    st.rerun()
+
+    with action_col2:
+        if st.button("Edit Selected Client", use_container_width=True, disabled=not single_selected):
+            selected_company = selected_rows.iloc[0]["Company Name"]
+            for idx, client in enumerate(st.session_state.clients):
+                if client["Company Name"] == selected_company:
+                    st.session_state.client_dialog_idx = idx
+                    st.session_state.client_dialog_edit_mode = True
+                    st.rerun()
+
+    with action_col3:
+        if st.button("Delete Selected Client", use_container_width=True, disabled=not single_selected):
+            selected_company = selected_rows.iloc[0]["Company Name"]
+            st.session_state.clients = [
+                client for client in st.session_state.clients
+                if client["Company Name"] != selected_company
+            ]
+            st.session_state.client_dialog_idx = None
+            st.session_state.client_dialog_edit_mode = False
+            save_json(CLIENTS_FILE, st.session_state.clients)
+            st.rerun()
+
+    if st.session_state.client_dialog_idx is not None:
+        show_client_dialog(st.session_state.client_dialog_idx)
 
 
 # --- Add Client Page ---
@@ -609,59 +977,75 @@ def add_client_page():
     with form_col1:
         company = st.text_input("Company Name")
         contact = st.text_input("Contact Person")
-        address = st.text_area("Address", height=150)
+        email = st.text_input("Email Address")
+        phone = st.text_input("Phone Number")
+        invoice_email = st.text_input("Invoice Email")
+        payment_terms = st.number_input("Payment Terms (days)", min_value=1, value=30)
+        vat_number = st.text_input("VAT / Tax Number")
 
-        if st.button("Save Client", use_container_width=True):
-            if company.strip() and contact.strip() and address.strip():
-                st.session_state.clients.append({
-                    "Company Name": company.strip(),
-                    "Contact Person": contact.strip(),
-                    "Address": address.strip()
-                })
-                save_json(CLIENTS_FILE, st.session_state.clients)
-                st.success("Client added!")
-                st.session_state.page = "my_clients"
-                st.rerun()
+    with form_col3:
+        currency_options = ["", "AED", "USD", "EUR", "GBP", "INR", "JPY", "CHF", "AUD", "CAD"]
+        default_currency = st.selectbox("Default Currency", currency_options, index=0)
+
+        use_custom_numbering = st.checkbox("Use Custom Numbering For This Client", value=False)
+        custom_mode_options = ["simple", "yearly"]
+        custom_numbering_mode = st.selectbox(
+            "Client Numbering Mode",
+            custom_mode_options,
+            index=0
+        )
+        custom_number_prefix = st.text_input(
+            "Client Number Prefix",
+            value=""
+        )
+        if use_custom_numbering:
+            sep = st.session_state.settings.get("invoice_numbering", {}).get("separator", "-")
+            digits = int(st.session_state.settings.get("invoice_numbering", {}).get("digits", 4))
+            preview_year = datetime.today().year
+            preview_prefix = custom_number_prefix.strip() or st.session_state.settings.get("invoice_numbering", {}).get("prefix", "INV")
+
+            if custom_numbering_mode == "simple":
+                preview = f"{preview_prefix}{sep}{1:0{digits}d}"
             else:
-                st.warning("Please complete all fields.")
+                preview = f"{preview_prefix}{sep}{preview_year}{sep}{1:0{digits}d}"
 
+            st.caption(f"Preview: {preview}")
 
-# --- Edit Client Page ---
-def edit_client_page():
-    idx = st.session_state.edit_client_idx
-    client = st.session_state.clients[idx]
+        address = st.text_area("Address", height=120)
+        notes = st.text_area("Notes", height=120)
 
-    page_header(
-        f"Edit Client #{idx+1}",
-        back_label="Back to Clients",
-        back_page="my_clients",
-        help_text="Update the selected client details."
-    )
-
-    form_col1, form_col2, form_col3 = st.columns([1.2, 0.1, 1.7])
-
-    with form_col1:
-        company = st.text_input("Company Name", client["Company Name"])
-        contact = st.text_input("Contact Person", client["Contact Person"])
-        address = st.text_area("Address", client["Address"], height=150)
-
-        if st.button("Save Changes", use_container_width=True):
-            st.session_state.clients[idx] = {
+    if st.button("Save Client", use_container_width=True):
+        if company.strip() and contact.strip() and address.strip():
+            st.session_state.clients.append({
                 "Company Name": company.strip(),
                 "Contact Person": contact.strip(),
-                "Address": address.strip()
-            }
+                "Email": email.strip(),
+                "Phone": phone.strip(),
+                "Invoice Email": invoice_email.strip(),
+                "Payment Terms": int(payment_terms),
+                "VAT Number": vat_number.strip(),
+                "Default Currency": default_currency.strip(),
+                "Use Custom Numbering": bool(use_custom_numbering),
+                "Custom Numbering Mode": custom_numbering_mode if use_custom_numbering else "",
+                "Custom Number Prefix": custom_number_prefix.strip() if use_custom_numbering else "",
+                "Address": address.strip(),
+                "Notes": notes.strip()
+            })
             save_json(CLIENTS_FILE, st.session_state.clients)
-            st.success("Client updated!")
+            st.success("Client added!")
+            st.session_state.client_dialog_idx = len(st.session_state.clients) - 1
+            st.session_state.client_dialog_edit_mode = False
             st.session_state.page = "my_clients"
             st.rerun()
+        else:
+            st.warning("Please complete Company Name, Contact Person, and Address.")
 
 
 # --- Create Invoice Page ---
 def create_invoice_page():
     page_header(
         "Generate New Invoice",
-        back_label="Back to Main Menu",
+        back_label="Back to Dashboard",
         back_page="main",
         help_text="Enter invoice details on the left and review the live preview on the right."
     )
@@ -681,18 +1065,18 @@ def create_invoice_page():
         client = st.session_state.clients[selected_idx]
 
         defaults = st.session_state.settings["invoice_defaults"]
-        default_currency = defaults.get("currency", "AED")
+        default_currency = client.get("Default Currency", "") or defaults.get("currency", "AED")
         default_tax = float(defaults.get("tax_percentage", 0.0))
-        default_terms = int(defaults.get("payment_terms_days", 30))
-
-        invoice_number = get_next_invoice_number()
-        st.text_input("Invoice Number", value=invoice_number, disabled=True)
+        default_terms = int(client.get("Payment Terms", defaults.get("payment_terms_days", 30)))
 
         date_col1, date_col2 = st.columns(2)
         with date_col1:
             invoice_date = st.date_input("Invoice Date", value=datetime.today())
         with date_col2:
-            due_date = st.date_input("Due Date", value=invoice_date + timedelta(days=default_terms))
+            due_date = st.date_input("Due Date", value=datetime.today() + timedelta(days=default_terms))
+
+        invoice_number = get_next_invoice_number(client=client, invoice_date=invoice_date)
+        st.text_input("Invoice Number", value=invoice_number, disabled=True)
 
         st.subheader("Line Items")
         items = []
@@ -736,8 +1120,8 @@ def create_invoice_page():
                 "Invoice Number": invoice_number,
                 "Client": client["Company Name"],
                 "Filename": filename,
-                "Date": invoice_date.strftime('%d/%m/%Y'),
-                "Due Date": due_date.strftime('%d/%m/%Y'),
+                "Date": invoice_date.strftime("%d/%m/%Y"),
+                "Due Date": due_date.strftime("%d/%m/%Y"),
                 "Status": "Draft",
                 "Items": items,
                 "Tax Percentage": tax_percent,
@@ -906,8 +1290,8 @@ def edit_invoice_page():
                 "Invoice Number": invoice_number,
                 "Client": client["Company Name"],
                 "Filename": filename,
-                "Date": invoice_date.strftime('%d/%m/%Y'),
-                "Due Date": due_date.strftime('%d/%m/%Y'),
+                "Date": invoice_date.strftime("%d/%m/%Y"),
+                "Due Date": due_date.strftime("%d/%m/%Y"),
                 "Status": status,
                 "Items": items,
                 "Tax Percentage": tax_percent,
@@ -949,26 +1333,30 @@ def show_dashboard():
         st.info("No invoices yet.")
         return
 
-    df = pd.DataFrame(st.session_state.invoices)
+    df = pd.DataFrame(st.session_state.invoices).copy()
 
-    if 'Total' not in df.columns:
-        df['Total'] = 0
-    if 'Status' not in df.columns:
-        df['Status'] = "Draft"
-    if 'Date' not in df.columns:
-        df['Date'] = datetime.today().strftime('%d/%m/%Y')
+    if "Total" not in df.columns:
+        df["Total"] = 0.0
+    if "Status" not in df.columns:
+        df["Status"] = "Draft"
+    if "Date" not in df.columns:
+        df["Date"] = datetime.today().strftime("%d/%m/%Y")
+    if "Paid Date" not in df.columns:
+        df["Paid Date"] = ""
 
-    df['Date_dt'] = pd.to_datetime(df['Date'], format='%d/%m/%Y', errors='coerce')
+    df["Date_dt"] = pd.to_datetime(df["Date"], format="%d/%m/%Y", errors="coerce")
+    df["Paid_dt"] = pd.to_datetime(df["Paid Date"], format="%d/%m/%Y", errors="coerce")
 
     today = datetime.today()
 
-    month_mask = (df['Date_dt'].dt.month == today.month) & (df['Date_dt'].dt.year == today.year)
-    year_mask = df['Date_dt'].dt.year == today.year
+    month_mask = (df["Date_dt"].dt.month == today.month) & (df["Date_dt"].dt.year == today.year)
+    year_mask = df["Date_dt"].dt.year == today.year
 
-    revenue_month = df.loc[month_mask, 'Total'].sum()
-    revenue_year = df.loc[year_mask, 'Total'].sum()
-    outstanding_revenue = df.loc[df['Status'].isin(['Sent', 'Overdue']), 'Total'].sum()
-    overdue_revenue = df.loc[df['Status'] == 'Overdue', 'Total'].sum()
+    revenue_month = df.loc[month_mask, "Total"].sum()
+    revenue_year = df.loc[year_mask, "Total"].sum()
+    outstanding_revenue = df.loc[df["Status"].isin(["Sent", "Overdue"]), "Total"].sum()
+    overdue_revenue = df.loc[df["Status"] == "Overdue", "Total"].sum()
+    paid_revenue = df.loc[df["Status"] == "Paid", "Total"].sum()
 
     metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
     metric_col1.metric("Revenue This Month", f"{revenue_month:,.2f}")
@@ -978,134 +1366,302 @@ def show_dashboard():
 
     st.markdown("---")
 
-    chart_col1, chart_col2 = st.columns(2)
+    outer_left, chart_left, middle_gap, chart_right, outer_right = st.columns([1.4, 1.2, 0.35, 1.2, 1.4])
 
-    with chart_col1:
-        revenue_by_client = df.groupby('Client')['Total'].sum()
-        if not revenue_by_client.empty and revenue_by_client.sum() > 0:
-            st.subheader("Revenue by Client")
-            fig1, ax1 = plt.subplots()
+    with chart_left:
+        st.markdown("##### Invoice Status Breakdown")
+
+        status_order = ["Draft", "Sent", "Overdue", "Paid", "Cancelled"]
+        status_counts = df["Status"].value_counts().reindex(status_order, fill_value=0)
+        status_counts = status_counts[status_counts > 0]
+
+        if not status_counts.empty:
+            fig1, ax1 = plt.subplots(figsize=(3.1, 2.6))
             ax1.pie(
-                revenue_by_client.values,
-                labels=revenue_by_client.index,
-                autopct='%1.1f%%',
-                startangle=90
+                status_counts.values,
+                labels=status_counts.index,
+                autopct="%1.1f%%",
+                startangle=90,
+                wedgeprops=dict(width=0.40)
             )
-            ax1.axis('equal')
-            st.pyplot(fig1)
+            ax1.axis("equal")
+            st.pyplot(fig1, width="content")
+        else:
+            st.info("No status data yet.")
+
+    with chart_right:
+        st.markdown("##### Top Clients by Revenue")
+
+        revenue_by_client = df.groupby("Client")["Total"].sum().sort_values(ascending=False).head(5)
+
+        if not revenue_by_client.empty and revenue_by_client.sum() > 0:
+            fig2, ax2 = plt.subplots(figsize=(3.5, 2.6))
+            ax2.barh(revenue_by_client.index[::-1], revenue_by_client.values[::-1])
+            ax2.set_xlabel("Revenue")
+            ax2.set_ylabel("")
+            ax2.spines["top"].set_visible(False)
+            ax2.spines["right"].set_visible(False)
+            st.pyplot(fig2, width="content")
         else:
             st.info("No client revenue data yet.")
 
-    with chart_col2:
-        revenue_df = df[df['Date_dt'].notna()].copy()
-        if not revenue_df.empty:
-            revenue_df['Month'] = revenue_df['Date_dt'].dt.to_period('M').astype(str)
-            revenue_by_month = revenue_df.groupby('Month')['Total'].sum().sort_index()
+    st.markdown("---")
 
-            if not revenue_by_month.empty and revenue_by_month.sum() > 0:
-                st.subheader("Revenue by Month")
-                fig2, ax2 = plt.subplots()
-                ax2.plot(revenue_by_month.index, revenue_by_month.values, marker='o')
-                ax2.set_xlabel("Month")
-                ax2.set_ylabel("Revenue")
-                ax2.tick_params(axis='x', rotation=45)
-                st.pyplot(fig2)
-            else:
-                st.info("No monthly revenue data yet.")
+    outer_left, chart_left, middle_gap, chart_right, outer_right = st.columns([1.4, 1.2, 0.35, 1.2, 1.4])
+
+    with chart_left:
+        st.markdown("##### Outstanding vs Paid")
+
+        compare_labels = ["Outstanding", "Paid"]
+        compare_values = [outstanding_revenue, paid_revenue]
+
+        if sum(compare_values) > 0:
+            fig3, ax3 = plt.subplots(figsize=(3.1, 2.6))
+            ax3.pie(
+                compare_values,
+                labels=compare_labels,
+                autopct="%1.1f%%",
+                startangle=90,
+                wedgeprops=dict(width=0.40)
+            )
+            ax3.axis("equal")
+            st.pyplot(fig3, width="content")
         else:
-            st.info("No monthly revenue data yet.")
+            st.info("No payment data yet.")
+
+    with chart_right:
+        st.markdown("##### Invoices Created per Month")
+
+        invoices_df = df[df["Date_dt"].notna()].copy()
+
+        if not invoices_df.empty:
+            invoices_df["Month"] = invoices_df["Date_dt"].dt.to_period("M").astype(str)
+            invoices_per_month = invoices_df.groupby("Month").size().sort_index()
+
+            if not invoices_per_month.empty:
+                fig4, ax4 = plt.subplots(figsize=(3.5, 2.6))
+                ax4.bar(invoices_per_month.index, invoices_per_month.values)
+                ax4.set_xlabel("Month")
+                ax4.set_ylabel("Invoices")
+                ax4.tick_params(axis="x", rotation=45)
+                ax4.spines["top"].set_visible(False)
+                ax4.spines["right"].set_visible(False)
+                st.pyplot(fig4, width="content")
+            else:
+                st.info("No monthly invoice data yet.")
+        else:
+            st.info("No monthly invoice data yet.")
 
 
 # --- My Invoices Page ---
 def my_invoices_page():
     ensure_invoice_fields()
 
-    page_header(
-        "My Invoices",
-        back_label="Back to Main Menu",
-        back_page="main",
-        help_text="Browse, filter, update, download, and manage your invoices."
-    )
+    header_left, header_right = st.columns([6, 2])
+
+    with header_left:
+        st.title("My Invoices")
+        st.caption("Browse, track, and manage invoice progress from draft through to payment.")
+
+    with header_right:
+        st.button(
+            "Back to Dashboard",
+            use_container_width=True,
+            on_click=lambda: st.session_state.update({"page": "main"})
+        )
+        st.button(
+            "Generate New Invoice",
+            use_container_width=True,
+            on_click=lambda: st.session_state.update({"page": "create_invoice"})
+        )
+
+    st.markdown("---")
 
     if not st.session_state.invoices:
         st.info("No invoices yet.")
         return
 
-    df = pd.DataFrame(st.session_state.invoices)
-    df['Date_dt'] = pd.to_datetime(df['Date'], format='%d/%m/%Y')
-    df['Due_dt'] = pd.to_datetime(df['Due Date'], format='%d/%m/%Y')
+    today = datetime.today().date()
+    df = pd.DataFrame(st.session_state.invoices).copy()
 
-    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    df["Date_dt"] = pd.to_datetime(df["Date"], format="%d/%m/%Y", errors="coerce")
+    df["Due_dt"] = pd.to_datetime(df["Due Date"], format="%d/%m/%Y", errors="coerce")
+    df["Sent_dt"] = pd.to_datetime(df.get("Sent Date", ""), format="%d/%m/%Y", errors="coerce")
+    df["Paid_dt"] = pd.to_datetime(df.get("Paid Date", ""), format="%d/%m/%Y", errors="coerce")
+
+    def calc_days(row):
+        status = row.get("Status", "")
+        due_dt = row.get("Due_dt")
+        if pd.isna(due_dt):
+            return ""
+
+        due_date = due_dt.date()
+
+        if status == "Draft":
+            return ""
+        if status == "Paid":
+            paid_dt = row.get("Paid_dt")
+            if pd.notna(paid_dt) and pd.notna(row.get("Date_dt")):
+                return f"Paid in {(paid_dt.date() - row['Date_dt'].date()).days}d"
+            return ""
+        if status == "Cancelled":
+            return ""
+        if status == "Overdue":
+            days = (today - due_date).days
+            return f"{days} day(s) overdue"
+        if status == "Sent":
+            days = (due_date - today).days
+            if days >= 0:
+                return f"Due in {days} day(s)"
+            return f"{abs(days)} day(s) overdue"
+        return ""
+
+    df["Tracking"] = df.apply(calc_days, axis=1)
+
+    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
     with filter_col1:
         search = st.text_input("Search Invoice Number")
     with filter_col2:
-        clients = ["All"] + sorted(df["Client"].unique().tolist())
+        clients = ["All"] + sorted(df["Client"].dropna().unique().tolist())
         client_filter = st.selectbox("Filter by Client", clients)
     with filter_col3:
-        status_filter = st.selectbox("Filter by Status", ["All", "Draft", "Sent", "Paid", "Overdue"])
+        status_filter = st.selectbox("Filter by Status", ["All", "Draft", "Sent", "Overdue", "Paid", "Cancelled"])
+    with filter_col4:
+        ageing_filter = st.selectbox("Quick View", ["All", "Outstanding", "Overdue", "Paid", "Cancelled"])
 
     filtered_df = df.copy()
+
     if search:
-        filtered_df = filtered_df[filtered_df["Invoice Number"].astype(str).str.contains(search)]
+        filtered_df = filtered_df[filtered_df["Invoice Number"].astype(str).str.contains(search, case=False, na=False)]
     if client_filter != "All":
-        filtered_df = filtered_df[filtered_df['Client'] == client_filter]
+        filtered_df = filtered_df[filtered_df["Client"] == client_filter]
     if status_filter != "All":
-        filtered_df = filtered_df[filtered_df['Status'] == status_filter]
+        filtered_df = filtered_df[filtered_df["Status"] == status_filter]
+    if ageing_filter == "Outstanding":
+        filtered_df = filtered_df[filtered_df["Status"].isin(["Sent", "Overdue"])]
+    elif ageing_filter == "Overdue":
+        filtered_df = filtered_df[filtered_df["Status"] == "Overdue"]
+    elif ageing_filter == "Paid":
+        filtered_df = filtered_df[filtered_df["Status"] == "Paid"]
+    elif ageing_filter == "Cancelled":
+        filtered_df = filtered_df[filtered_df["Status"] == "Cancelled"]
+
+    active_df = filtered_df[filtered_df["Status"] != "Cancelled"]
+
+    stats_col1, stats_col2, stats_col3, stats_col4 = st.columns(4)
+    stats_col1.metric("Filtered Total", f"{active_df['Total'].sum():,.2f}")
+    stats_col2.metric("Outstanding", f"{filtered_df[filtered_df['Status'].isin(['Sent', 'Overdue'])]['Total'].sum():,.2f}")
+    stats_col3.metric("Overdue", f"{filtered_df[filtered_df['Status'] == 'Overdue']['Total'].sum():,.2f}")
+    stats_col4.metric("Paid", f"{filtered_df[filtered_df['Status'] == 'Paid']['Total'].sum():,.2f}")
 
     st.markdown("---")
     st.subheader("Invoices Table")
-    table_df = filtered_df[['Invoice Number', 'Client', 'Date', 'Due Date', 'Status', 'Total']].copy()
+
+    table_df = filtered_df[[
+        "Invoice Number",
+        "Client",
+        "Date",
+        "Due Date",
+        "Status",
+        "Tracking",
+        "Total"
+    ]].copy()
+
+    status_icons = {
+        "Draft": "⚪ Draft",
+        "Sent": "🔵 Sent",
+        "Overdue": "🔴 Overdue",
+        "Paid": "🟢 Paid",
+        "Cancelled": "🟠 Cancelled"
+    }
+    table_df["Status"] = table_df["Status"].map(status_icons).fillna(table_df["Status"])
     table_df["Select"] = False
 
-    edited_df = st.data_editor(table_df, use_container_width=True, num_rows="fixed", hide_index=True)
+    edited_df = st.data_editor(
+        table_df,
+        use_container_width=True,
+        num_rows="fixed",
+        hide_index=True,
+        disabled=["Invoice Number", "Client", "Date", "Due Date", "Status", "Tracking", "Total"]
+    )
+
     selected_rows = edited_df[edited_df["Select"] == True]
+    selected_count = len(selected_rows)
+    has_selection = selected_count > 0
+    single_selected = selected_count == 1
 
-    if not selected_rows.empty:
-        st.markdown("---")
-        st.subheader("Selected Invoice Actions")
-        st.caption(f"{len(selected_rows)} invoice(s) selected")
+    st.markdown("---")
+    st.subheader("Selected Invoice Actions")
 
-        row1_col1, row1_col2, row1_col3, row1_col4 = st.columns(4)
+    if selected_count == 0:
+        st.caption("Select one or more invoices from the table to enable actions.")
+    elif selected_count == 1:
+        st.caption("1 invoice selected.")
+    else:
+        st.caption(f"{selected_count} invoices selected.")
 
-        with row1_col1:
-            if len(selected_rows) == 1 and st.button("Edit Selected Invoice", use_container_width=True):
-                selected_invoice_number = selected_rows.iloc[0]["Invoice Number"]
-                for idx, inv in enumerate(st.session_state.invoices):
-                    if inv["Invoice Number"] == selected_invoice_number:
-                        st.session_state.edit_invoice_idx = idx
-                        st.session_state.page = "edit_invoice"
-                        st.rerun()
+    row1_col1, row1_col2, row1_col3, row1_col4, row1_col5 = st.columns(5)
 
-        with row1_col2:
-            if st.button("Mark as Draft", use_container_width=True):
-                for _, row in selected_rows.iterrows():
-                    for inv in st.session_state.invoices:
-                        if inv["Invoice Number"] == row["Invoice Number"]:
-                            inv["Status"] = "Draft"
-                save_json(INVOICES_FILE, st.session_state.invoices)
-                st.rerun()
+    with row1_col1:
+        if st.button("Edit Selected", use_container_width=True, disabled=not single_selected):
+            selected_invoice_number = selected_rows.iloc[0]["Invoice Number"]
+            for idx, inv in enumerate(st.session_state.invoices):
+                if inv["Invoice Number"] == selected_invoice_number:
+                    st.session_state.edit_invoice_idx = idx
+                    st.session_state.page = "edit_invoice"
+                    st.rerun()
 
-        with row1_col3:
-            if st.button("Mark as Sent", use_container_width=True):
-                for _, row in selected_rows.iterrows():
-                    for inv in st.session_state.invoices:
-                        if inv["Invoice Number"] == row["Invoice Number"]:
-                            inv["Status"] = "Sent"
-                save_json(INVOICES_FILE, st.session_state.invoices)
-                st.rerun()
+    with row1_col2:
+        if st.button("Mark as Draft", use_container_width=True, disabled=not has_selection):
+            for _, row in selected_rows.iterrows():
+                for inv in st.session_state.invoices:
+                    if inv["Invoice Number"] == row["Invoice Number"]:
+                        inv["Status"] = "Draft"
+                        inv["Sent Date"] = ""
+                        inv["Paid Date"] = ""
+            save_json(INVOICES_FILE, st.session_state.invoices)
+            st.rerun()
 
-        with row1_col4:
-            if st.button("Mark as Paid", use_container_width=True):
-                for _, row in selected_rows.iterrows():
-                    for inv in st.session_state.invoices:
-                        if inv["Invoice Number"] == row["Invoice Number"]:
-                            inv["Status"] = "Paid"
-                save_json(INVOICES_FILE, st.session_state.invoices)
-                st.rerun()
+    with row1_col3:
+        if st.button("Mark as Sent", use_container_width=True, disabled=not has_selection):
+            sent_today = datetime.today().strftime("%d/%m/%Y")
+            for _, row in selected_rows.iterrows():
+                for inv in st.session_state.invoices:
+                    if inv["Invoice Number"] == row["Invoice Number"] and inv["Status"] != "Cancelled":
+                        inv["Status"] = "Sent"
+                        if not inv.get("Sent Date"):
+                            inv["Sent Date"] = sent_today
+                        inv["Paid Date"] = ""
+            save_json(INVOICES_FILE, st.session_state.invoices)
+            st.rerun()
 
-        row2_col1, row2_col2, row2_col3 = st.columns([1, 1, 2])
+    with row1_col4:
+        if st.button("Mark as Paid", use_container_width=True, disabled=not has_selection):
+            paid_today = datetime.today().strftime("%d/%m/%Y")
+            for _, row in selected_rows.iterrows():
+                for inv in st.session_state.invoices:
+                    if inv["Invoice Number"] == row["Invoice Number"] and inv["Status"] != "Cancelled":
+                        inv["Status"] = "Paid"
+                        inv["Paid Date"] = paid_today
+                        if not inv.get("Sent Date"):
+                            inv["Sent Date"] = inv.get("Date", paid_today)
+            save_json(INVOICES_FILE, st.session_state.invoices)
+            st.rerun()
 
-        with row2_col1:
+    with row1_col5:
+        if st.button("Mark as Cancelled", use_container_width=True, disabled=not has_selection):
+            for _, row in selected_rows.iterrows():
+                for inv in st.session_state.invoices:
+                    if inv["Invoice Number"] == row["Invoice Number"]:
+                        inv["Status"] = "Cancelled"
+                        inv["Paid Date"] = ""
+            save_json(INVOICES_FILE, st.session_state.invoices)
+            st.rerun()
+
+    row2_col1, row2_col2, row2_col3 = st.columns([1, 1, 2])
+
+    with row2_col1:
+        if has_selection:
             selected_files = []
             for _, row in selected_rows.iterrows():
                 invoice = df[df["Invoice Number"] == row["Invoice Number"]].iloc[0]
@@ -1137,10 +1693,12 @@ def my_invoices_page():
                     mime="application/zip",
                     use_container_width=True
                 )
+        else:
+            st.button("Download as PDF", use_container_width=True, disabled=True)
 
-        with row2_col2:
-            if st.button("Delete Selected", use_container_width=True):
-                st.session_state.confirm_delete_invoices = True
+    with row2_col2:
+        if st.button("Delete Selected", use_container_width=True, disabled=not has_selection):
+            st.session_state.confirm_delete_invoices = True
 
     if st.session_state.confirm_delete_invoices:
         st.warning("Are you sure you want to delete the selected invoice(s)? This cannot be undone.")
@@ -1170,12 +1728,6 @@ def my_invoices_page():
                 st.session_state.confirm_delete_invoices = False
                 st.rerun()
 
-    st.markdown("---")
-    footer_col1, footer_col2 = st.columns([1, 3])
-    with footer_col1:
-        total_revenue = filtered_df["Total"].sum()
-        st.metric("Total Revenue (Filtered)", f"{total_revenue:,.2f}")
-
 
 # --- Navigation ---
 if st.session_state.page == "main":
@@ -1184,8 +1736,6 @@ elif st.session_state.page == "my_clients":
     _ = my_clients_page()
 elif st.session_state.page == "add_client":
     _ = add_client_page()
-elif st.session_state.page == "edit_client":
-    _ = edit_client_page()
 elif st.session_state.page == "create_invoice":
     _ = create_invoice_page()
 elif st.session_state.page == "my_invoices":
