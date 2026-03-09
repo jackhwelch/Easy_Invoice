@@ -10,6 +10,7 @@ import zipfile
 import matplotlib.pyplot as plt
 import base64
 import streamlit.components.v1 as components
+from streamlit_pdf_viewer import pdf_viewer
 
 st.set_page_config(layout="wide")
 
@@ -433,16 +434,7 @@ def generate_invoice_pdf_bytes(my_details, client, invoice_number, items, tax_pe
 
 
 def show_pdf_preview(pdf_bytes):
-    base64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
-    pdf_display = f"""
-        <iframe
-            src="data:application/pdf;base64,{base64_pdf}"
-            width="100%"
-            height="820"
-            style="border: 1px solid #ddd; border-radius: 8px; background: white;"
-        ></iframe>
-    """
-    components.html(pdf_display, height=830, scrolling=True)
+    pdf_viewer(pdf_bytes, width="100%")
 
 
 # --- My Clients Page ---
