@@ -13,11 +13,13 @@ import base64
 st.set_page_config(layout="wide")
 
 # --- File paths ---
-DETAILS_FILE = "my_details.json"
-CLIENTS_FILE = "clients.json"
-INVOICES_FILE = "invoices.json"
-SETTINGS_FILE = "settings.json"
-LOGO_FILE = "logo.png"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DETAILS_FILE = os.path.join(BASE_DIR, "my_details.json")
+CLIENTS_FILE = os.path.join(BASE_DIR, "clients.json")
+INVOICES_FILE = os.path.join(BASE_DIR, "invoices.json")
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+LOGO_FILE = os.path.join(BASE_DIR, "logo.png")
 
 
 # --- Default settings ---
