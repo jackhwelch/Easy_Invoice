@@ -434,7 +434,25 @@ def generate_invoice_pdf_bytes(my_details, client, invoice_number, items, tax_pe
 
 
 def show_pdf_preview(pdf_bytes):
+    st.markdown(
+        """
+        <style>
+        .pdf-preview-shell {
+            background: #f3f4f6;
+            border: 1px solid #d1d5db;
+            border-radius: 12px;
+            padding: 14px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+            margin-top: 6px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+    st.markdown('<div class="pdf-preview-shell">', unsafe_allow_html=True)
     pdf_viewer(pdf_bytes, width="100%")
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 # --- My Clients Page ---
